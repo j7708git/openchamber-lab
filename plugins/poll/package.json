@@ -1,0 +1,11 @@
+{
+  "name": "@openchamber-lab/plugin-poll",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "多模型諮詢：一次邀請多個模型對同一問題發表一次性意見",
+  "main": "index.ts",
+  "devDependencies": {
+    "@opencode/plugin": "2.0.29"
+  }
+}

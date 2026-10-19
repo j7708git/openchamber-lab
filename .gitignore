@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+*.log
+
+# 內部工作紀錄與暫存：留在本機，不進版控
+.local/
+.openchamber/
+.tmp/
+.scratch/
