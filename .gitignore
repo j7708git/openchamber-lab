@@ -9,3 +9,9 @@ dist/
 .openchamber/
 .tmp/
 .scratch/
+
+# mcp/desktop：本機 Python 環境、smoke 日誌與下載的 wheel
+.venv/
+.logs/
+*.whl
+__pycache__/
