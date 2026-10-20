@@ -190,6 +190,48 @@ fallback（初始 `timeout_ms=2000`）。這是 timeout 上限，不是 2048／�
 `act-kate-en.txt` → 嘗試 `input.text("桌面測試")`（預期失敗）→ 額外診斷
 `ax.set_text` 與 clipboard → 動後截圖與游標裁切 → 只關自己的 Kate。
 
+## helper.py 與 desktop-use skill
+
+`helper.py` 是給 flash 級模型用的薄 CLI；所有子命令都在同一個 Python 程序內完成
+observe → act，AX index 不跨程序。
+
+```bash
+cd ~/workspace/agent/openchamber-lab/mcp/desktop
+.venv/bin/python helper.py --help
+DESKTOP_DRYRUN=1 .venv/bin/python helper.py ax --app kate
+```
+
+- `shot`：整桌面截圖。
+- `ax --app APP`：只輸出該 app 的 AX 子樹（預設最多 80 行）。
+- `click --app APP (--role ROLE --name NAME | --x X --y Y)`。
+- `type TEXT --app APP [--role ROLE --name NAME] [--verify-file PATH]`。
+- `paste TEXT --app APP [--verify-file PATH]`。
+- `key KEY [--modifiers ctrl,alt] --app APP`。
+
+`DESKTOP_DRYRUN=1` 或 `--dry-run` 只印計畫，不建 Runtime、不送 XTEST、不寫
+clipboard。skill 在 `skills/desktop-use/SKILL.md`（過渡版，尚未掛到
+`.opencode/`）。
+
+三條輸入路徑：ASCII 用 `input.text`；中文首選 `ax.set_text`，無效果才用
+clipboard；clipboard 一定先存後還原，非文字剪貼簿回 `CLIPBOARD_NOT_TEXT`。
+v0.1.2 不支援 `max_nodes`／`max_depth`，helper 用 `timeout_ms=2000/4000`
+fallback。
+
+`ax` 的 `depth` 分級：
+
+- `frame-only`：只有 application + frame/window/dialog。
+- `chrome-only`：有 menu_bar／tool_bar／filler／panel 等，但沒有 editable 的
+  textbox/text。
+- `controls`：至少有一個 `editable=True` 的節點。
+- `empty`：只有 application 或空。
+
+`depth=ok` 不代表有 editable；新 helper 不再使用 `ok`，只有 `controls` 才可能有可編輯控制項。
+`chrome-only` 時可以用 menu/toolbar 的 AX 點擊，但打字要用截圖座標或
+clipboard。不要說「AX 可用」；要說「partial、menu/toolbar 有、editable 沒有」。
+
+helper 只操作自己開的 app：Kate 用 `kate --new`、Dolphin 用
+`dolphin --new-window`；不碰既有視窗。
+
 ## 已知限制（Linux adapter v0.1.2）
 
 - **沒有 `device.list_windows` / `apps`。** `Device.windows` 與 `apps` 在 Linux

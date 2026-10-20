@@ -1182,6 +1182,33 @@ async def run_read(rec: Recorder, stamp: str, apps: set[str]) -> dict:
         if not cleanup["ok"]:
             result["ok"] = False
             result["errors"].append("cleanup FAIL: process group still alive")
+
+    rec.add(
+        "read",
+        "summary.window_guard",
+        0.0,
+        bool(guard.get("ok")),
+        before=str(before_path),
+        after=str(after_path),
+        missing=guard.get("missing", []),
+        changed=guard.get("changed", []),
+        new=guard.get("new", []),
+    )
+    rec.add(
+        "read",
+        "summary.cleanup",
+        0.0,
+        bool(cleanup.get("ok")),
+        apps=cleanup.get("apps", []),
+    )
+    rec.add(
+        "read",
+        "summary.read",
+        0.0,
+        bool(result.get("ok")),
+        log=str(rec.path),
+        errors=result.get("errors", []),
+    )
     return result
 
 
@@ -1699,6 +1726,15 @@ async def main_async(phase: str, apps: set[str]) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     ok = all(result.get("ok") for result in results)
     print(f"RESULT {'PASS' if ok else 'FAIL'} phase={phase} log={rec.path}")
+    rec.add(
+        phase,
+        "summary.result",
+        0.0,
+        ok,
+        log=str(rec.path),
+        phases=[result.get("phase") for result in results],
+        errors=[error for result in results for error in result.get("errors", [])],
+    )
     return 0 if ok else 1
 
 
