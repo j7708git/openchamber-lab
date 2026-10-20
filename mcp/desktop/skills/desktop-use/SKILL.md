@@ -1,9 +1,28 @@
+---
+name: desktop-use
+description: Operate this machine's KDE/X11 desktop through the OpenGCUA Linux helper in the OpenChamber lab. Use for screenshot + coordinate clicks, keyboard shortcuts, and clipboard text (including Chinese). Machine-specific: X11 :0, helper venv, OpenGCUA v0.1.2; not for Wayland or other machines.
+---
+
 # desktop-use
 
 OpenGCUA Linux X11 桌面操作。所有指令都在
 `~/workspace/agent/openchamber-lab/mcp/desktop` 下執行。
 
 授權／狀態：2026-10-20 使用者 Q3=A：維持 S3、不做 S5、不掛 MCP；AX 只供除錯。
+
+## 前提（機器限定）
+
+這個 skill **只在這一台機器**可用：KDE Plasma on X11、X 在 `:0`、
+`~/.Xauthority` 存在、使用者 D-Bus 在 `/run/user/1000/bus`、OpenGCUA
+`qwen-intelligence-sdk` v0.1.2、host venv 在
+`~/workspace/agent/openchamber-lab/mcp/desktop/.venv`、worker venv 在
+`~/.cache/mai-ui/linux/0.3/venv`。
+
+- **不支援 Wayland**；別台機器、其他 display、其他 SDK 版本都不要直接套。
+- helper 自己會設 `DISPLAY=:0`、`XAUTHORITY`、`DBUS_SESSION_BUS_ADDRESS`；
+  但**用 shell 直接開 Kate／Dolphin 時仍要自己帶**這三個變數。B2 實際發生：
+  漏了 `DISPLAY` 的 `setsid kate --new` 直接 core dump。
+- **跑真輸入前先請使用者讓出滑鼠／鍵盤**；不要假設一般「可以跑」涵蓋桌面控制。
 
 ## 主路徑
 
@@ -52,6 +71,10 @@ DESKTOP_DRYRUN=1 .venv/bin/python helper.py click --app kate --x 500 --y 300
   先記錄 `_NET_CLIENT_LIST_STACKING`，只操作自己開的 app。
 - `DESKTOP_DRYRUN=1` 或 `--dry-run` 先看計畫；dry-run 不建 Runtime、不送 XTEST、
   不寫 clipboard。危險鍵在 dry-run 也會拒絕。
+- **exit 0 不是驗收**。helper 回 `verified=False` 代表它沒讀到目標；要另一次
+  `shot` 目視，或用 `--verify-file`／`cat` 比對檔案。receipt 的
+  `effect=unknown` 也不能當成功。
+- **真輸入前先請使用者讓出滑鼠／鍵盤**；不要假設一般「可以跑」涵蓋桌面控制。
 
 ## 輸入路徑
 
@@ -105,6 +128,16 @@ editable 沒有」。
 .venv/bin/python helper.py key s --modifiers ctrl --app kate
 # 若有 --verify-file，type/paste 會直接讀檔檢查
 ```
+
+## 驗收
+
+- `helper.py type`／`paste` 的 `verified=False` 只代表 helper 沒能讀到目標，
+  不代表文字有進去；**exit 0 不是驗收**。
+- 驗收方式：另一次 `helper.py shot` 目視，或 `--verify-file PATH`，或
+  `cat`／`xxd` 比對檔案。
+- Kate 會補尾端換行；用 contains，不要 exact match。
+- `formats_preserved=false` 時照 helper 的 warning 說「格式剩 N 項」，
+  不要說「已完全還原」。
 
 ## 錯誤與下一步
 
