@@ -172,13 +172,16 @@ fallback（初始 `timeout_ms=2000`）。這是 timeout 上限，不是 2048／�
 ### 文字輸入的三條路徑
 
 - ASCII → `ui.input.text`（Linux 只保證 group 1 unshifted/shifted 的 ASCII）。
-- 中文 → `ui.ax.set_text` 首選；若沒有可觀察效果 → clipboard paste 兜底。
-- 兜底 → clipboard paste，必須先 save、用完 restore。
+- 中文 → **一律 clipboard paste**；`--ax-debug` + `--role/--name` 的
+  `ax.set_text` 只供除錯，不建議使用。
+- 兜底 → clipboard paste，必須先 save、用完 restore；文字會還原，但 TARGETS／
+  格式可能不完整（回 `formats_preserved` 與 warning）。
 - 不可以用 `ui.input.text` 打中文。
 
 `ClipboardGuard` 用 `xclip -o -selection clipboard -t TARGETS` 判斷是否為文字；
-沒有 `text/plain`／`UTF8_STRING` 就拒絕，回 `CLIPBOARD_NOT_TEXT`，不覆蓋。save
-後在 `finally` 用 `xclip -i -selection clipboard` 還原；原本是空字串就還原成空。
+沒有 `text/plain`／`UTF8_STRING` 就拒絕，回 `CLIPBOARD_NOT_TEXT`。寫入／還原用
+Popen 的 xclip 且**不 wait**（xclip 留在背景持有 selection 是正常的）；等 0.25
+秒後驗證文字，失敗回 `CLIPBOARD_WRITE_FAILED`／`CLIPBOARD_RESTORE_FAILED`。
 
 `DESKTOP_DRYRUN=1 ... --phase act` 只印計畫（要開哪個 app、點哪裡、打什麼、按
 什麼），不建立 Runtime、不送 XTEST、不寫 clipboard。所有 `press_key` 前會檢查
@@ -192,8 +195,9 @@ fallback（初始 `timeout_ms=2000`）。這是 timeout 上限，不是 2048／�
 
 ## helper.py 與 desktop-use skill
 
-`helper.py` 是給 flash 級模型用的薄 CLI；所有子命令都在同一個 Python 程序內完成
-observe → act，AX index 不跨程序。
+`helper.py` 是給 flash 級模型用的薄 CLI；主路徑是**截圖找位置 → 座標點擊 →
+鍵盤／剪貼簿**。AX 只供除錯，不是定位來源；所有子命令都在同一個 Python 程序內
+完成 observe → act，AX index 不跨程序。
 
 ```bash
 cd ~/workspace/agent/openchamber-lab/mcp/desktop
@@ -202,22 +206,29 @@ DESKTOP_DRYRUN=1 .venv/bin/python helper.py ax --app kate
 ```
 
 - `shot`：整桌面截圖。
-- `ax --app APP`：只輸出該 app 的 AX 子樹（預設最多 80 行）。
-- `click --app APP (--role ROLE --name NAME | --x X --y Y)`。
-- `type TEXT --app APP [--role ROLE --name NAME] [--verify-file PATH]`。
-- `paste TEXT --app APP [--verify-file PATH]`。
+- `ax --app APP`：**DEBUG ONLY**，只輸出該 app 的 AX 子樹（預設最多 80 行）。
+- `click --app APP --x X --y Y`：主路徑座標點擊。
+- `click --app APP --role ROLE --name NAME --ax-debug`：AX 除錯點擊；沒有
+  `--ax-debug` 會回 `AX_DEBUG_ONLY`。
+- `type TEXT --app APP [--verify-file PATH]`：ASCII 用 `input.text`；非 ASCII
+  預設 clipboard。
+- `type TEXT --app APP --role ROLE --name NAME --ax-debug`：除錯用
+  `ax.set_text`，失敗才 fallback clipboard。
+- `paste TEXT --app APP [--verify-file PATH]`：guarded clipboard。
 - `key KEY [--modifiers ctrl,alt] --app APP`。
 
 `DESKTOP_DRYRUN=1` 或 `--dry-run` 只印計畫，不建 Runtime、不送 XTEST、不寫
 clipboard。skill 在 `skills/desktop-use/SKILL.md`（過渡版，尚未掛到
 `.opencode/`）。
 
-三條輸入路徑：ASCII 用 `input.text`；中文首選 `ax.set_text`，無效果才用
-clipboard；clipboard 一定先存後還原，非文字剪貼簿回 `CLIPBOARD_NOT_TEXT`。
-v0.1.2 不支援 `max_nodes`／`max_depth`，helper 用 `timeout_ms=2000/4000`
-fallback。
+clipboard 文字會還原，但 TARGETS／格式可能不完整。helper 會回
+`clipboard_restored`、`formats_preserved`、`clipboard_formats_before/after`、
+`clipboard_warning` 與 `clipboard_owner_pid`；若 warning 出現「格式剩 N 項，請
+重新複製一次以徹底回復」，不要說已完全還原。非文字剪貼簿回
+`CLIPBOARD_NOT_TEXT`。
 
-`ax` 的 `depth` 分級：
+v0.1.2 不支援 `max_nodes`／`max_depth`，helper 用 `timeout_ms=2000/4000`
+fallback。`ax` 的 `depth` 分級：
 
 - `frame-only`：只有 application + frame/window/dialog。
 - `chrome-only`：有 menu_bar／tool_bar／filler／panel 等，但沒有 editable 的
@@ -225,9 +236,12 @@ fallback。
 - `controls`：至少有一個 `editable=True` 的節點。
 - `empty`：只有 application 或空。
 
-`depth=ok` 不代表有 editable；新 helper 不再使用 `ok`，只有 `controls` 才可能有可編輯控制項。
-`chrome-only` 時可以用 menu/toolbar 的 AX 點擊，但打字要用截圖座標或
-clipboard。不要說「AX 可用」；要說「partial、menu/toolbar 有、editable 沒有」。
+`depth=ok` 不代表有 editable；新 helper 不再使用 `ok`，只有 `controls` 才可能有
+可編輯控制項。`chrome-only` 時可以用 menu/toolbar 的 AX 點擊，但打字要用截圖
+座標或 clipboard。不要說「AX 可用」；要說「partial、menu/toolbar 有、editable
+沒有」。
+
+授權／狀態：2026-10-20 使用者 Q3=A：維持 S3、不做 S5、不掛 MCP；AX 只供除錯。
 
 helper 只操作自己開的 app：Kate 用 `kate --new`、Dolphin 用
 `dolphin --new-window`；不碰既有視窗。
@@ -256,12 +270,20 @@ helper 只操作自己開的 app：Kate 用 `kate --new`、Dolphin 用
   `clipboard.write({"text/plain": "桌面測試"})` + Ctrl+A / Ctrl+V / Ctrl+S，
   檔案可得到 `桌面測試`；這是繞過 `input.text` 的替代路線，不代表 keysym
   路徑支援中文。
+- **clipboard 文字會還原，但 TARGETS／格式可能不完整。** helper 回
+  `formats_preserved`、`clipboard_formats_before/after` 與
+  `clipboard_warning`；若 warning 出現「格式剩 N 項，請重新複製一次以徹底回復」，
+  不要說已完全還原。非文字剪貼簿回 `CLIPBOARD_NOT_TEXT`。
 - **XTEST 只支援前景輸入。** worker 對 `delivery="background"` 直接回
   `UNSUPPORTED_CAPABILITY: Linux input is foreground only`。
 - **只支援 X11。** Wayland 不支援；`DISPLAY`、`XAUTHORITY` 與圖形 session 的
   D-Bus 必須指向同一個桌面。
 - **AT-SPI 名稱可能落後 X11 標題。** 視窗標題已在 X11 改變時，AX 節點名稱不一定
   立即同步。
+- **Kate 存檔會補尾端換行。** B2 觀察：`alpha` → `alpha\n`；精確字串比對要改用
+  contains。
+- **Dolphin 雙擊進目錄目前做不到。** `click --count 2` 只選取、不進入；不要把它
+  當成可完成能力，沒有可靠替代路徑就記失敗。
 
 ## 疑難排解
 

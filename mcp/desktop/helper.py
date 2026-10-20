@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """desktop helper：一支程式內完成 observe → act；AX index 不跨程序。
 
+**主路徑**：shot 截圖找位置 → click --x/--y（座標）→ keyboard／clipboard。
+**AX 只供除錯**：ax 子命令、click --role/--name、type 的 ax.set_text 都需要
+`--ax-debug`（ax 子命令本身即除錯）；不要把 AX 當定位來源。
+
 給 flash 級模型用的薄 CLI。每個命令輸出：
   一行 `OK ...` 或 `ERR CODE ...` 摘要
   一行 JSON 細節
 失敗一律 exit 1，代碼是 typed error（APP_NOT_FOUND、APP_NOT_ACTIVE、
-TARGET_NOT_FOUND、TARGET_AMBIGUOUS、AX_EMPTY、CLIPBOARD_NOT_TEXT、
+TARGET_NOT_FOUND、TARGET_AMBIGUOUS、AX_EMPTY、AX_DEBUG_ONLY、
+CLIPBOARD_NOT_TEXT、CLIPBOARD_WRITE_FAILED、CLIPBOARD_RESTORE_FAILED、
 DANGEROUS_KEY_REFUSED、POINT_OUTSIDE_APP、VERIFY_FAILED 等）。
 
 `DESKTOP_DRYRUN=1` 或 `--dry-run`：只印計畫，不建立 Runtime、不送 XTEST、
@@ -15,6 +20,9 @@ AX 限制：v0.1.2 的 `AX.observe(max_nodes=..., max_depth=...)` 會回
 `UNSUPPORTED_CAPABILITY: AX capture limits are WIP`；helper 先照要求帶限制，
 原樣記錄 `limits_unsupported=true`，再用 `timeout_ms=2000/4000` fallback。
 `--app` 是事後過濾 application 節點，capture 仍是 desktop-wide。
+
+clipboard 文字會還原，但 TARGETS／格式可能不完整；helper 回
+`formats_preserved` 與 warning，不要把 `clipboard_restored=true` 當成完整還原。
 """
 
 from __future__ import annotations
@@ -41,6 +49,8 @@ DANGEROUS_COMBOS = {
     "ctrl+alt+f6", "ctrl+alt+f7", "ctrl+alt+f8", "ctrl+alt+f9", "ctrl+alt+f10",
     "ctrl+alt+f11", "ctrl+alt+f12", "ctrl+alt+backspace", "super+l", "super+q",
 }
+
+AX_DEBUG_WARNING = "WARN AX 只供除錯；主路徑用 shot + click --x/--y / keyboard / clipboard。"
 
 
 class HelperError(Exception):
@@ -170,7 +180,12 @@ async def press_key_checked(device, key: str, modifiers):
 
 
 class ClipboardGuard:
-    """保存／還原純文字剪貼簿；非文字剪貼簿拒絕使用。"""
+    """保存／還原純文字剪貼簿；非文字剪貼簿拒絕使用。
+
+    xclip -i 會留在前景持有 selection，因此寫入／還原都用 Popen 且**不 wait**；
+    只等 0.25 秒後用 xclip -o 驗證文字。TARGETS 格式不保證完整還原，會回
+    formats_preserved 與 warning，但不因此把文字還原判失敗。
+    """
 
     TEXT_ATOMS = {"UTF8_STRING", "text/plain", "text/plain;charset=utf-8", "STRING", "TEXT"}
 
@@ -178,41 +193,120 @@ class ClipboardGuard:
         self.text: str | None = None
         self.saved = False
         self.restored = False
+        self.targets_before: set[str] = set()
+        self.targets_after: set[str] = set()
+        self.formats_before_count = 0
+        self.formats_after_count = 0
+        self.formats_preserved: bool | None = None
+        self.clipboard_warning: str | None = None
+        self.owner_pid: int | None = None
+        self.write_owner_pid: int | None = None
+        self.restore_owner_pid: int | None = None
+
+    def _targets(self) -> set[str]:
+        proc = _run(
+            ["xclip", "-o", "-selection", "clipboard", "-t", "TARGETS"],
+            timeout=10,
+        )
+        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+    def _read_text(self) -> str:
+        proc = _run(["xclip", "-o", "-selection", "clipboard"], timeout=10)
+        if proc.returncode != 0 and proc.stdout == "":
+            return ""
+        if proc.returncode != 0:
+            raise HelperError(
+                "CLIPBOARD_NOT_TEXT",
+                f"無法讀取文字剪貼簿（exit {proc.returncode}）：{proc.stderr.strip()}",
+            )
+        return proc.stdout
+
+    def _verify_text(self, expected: str) -> bool:
+        proc = _run(["xclip", "-o", "-selection", "clipboard"], timeout=10)
+        if proc.returncode == 0 and proc.stdout == expected:
+            return True
+        if proc.returncode != 0 and proc.stdout == "" and expected == "":
+            return True
+        return False
+
+    def _start_write(self, text: str) -> int:
+        """Popen 寫入，關 stdin；不 wait。回傳 xclip owner pid。"""
+        try:
+            proc = subprocess.Popen(
+                ["xclip", "-i", "-selection", "clipboard"],
+                stdin=subprocess.PIPE,
+                text=True,
+                env=os.environ,
+            )
+        except OSError as exc:
+            raise OSError(f"無法啟動 xclip：{exc}") from exc
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(text)
+                proc.stdin.close()
+        except (BrokenPipeError, OSError) as exc:
+            raise OSError(f"寫入 xclip stdin 失敗：{exc}") from exc
+        time.sleep(0.25)
+        return proc.pid
 
     def save(self) -> None:
-        targets = _run(["xclip", "-o", "-selection", "clipboard", "-t", "TARGETS"], timeout=10)
-        atoms = {line.strip() for line in targets.stdout.splitlines() if line.strip()}
-        if targets.returncode != 0 and not atoms:
+        self.targets_before = self._targets()
+        self.formats_before_count = len(self.targets_before)
+        if not self.targets_before:
+            # 空剪貼簿：視為空字串，restore() 會還原成空。
             self.text = ""
             self.saved = True
             return
-        if not (atoms & self.TEXT_ATOMS):
+        if not (self.targets_before & self.TEXT_ATOMS):
             raise HelperError(
                 "CLIPBOARD_NOT_TEXT",
                 "clipboard TARGETS 不含 text/plain 或 UTF8_STRING；拒絕覆蓋",
-                {"targets": sorted(atoms)},
+                {"targets": sorted(self.targets_before)},
             )
-        read = _run(["xclip", "-o", "-selection", "clipboard"], timeout=10)
-        if read.returncode != 0:
-            raise HelperError(
-                "CLIPBOARD_NOT_TEXT",
-                f"無法讀取文字剪貼簿（exit {read.returncode}）：{read.stderr.strip()}",
-            )
-        self.text = read.stdout
+        self.text = self._read_text()
         self.saved = True
+
+    def write(self, text: str) -> None:
+        if not self.saved:
+            raise HelperError("INVALID_ARGUMENT", "ClipboardGuard.save() 必須先呼叫")
+        try:
+            self.write_owner_pid = self._start_write(text)
+        except OSError as exc:
+            raise HelperError(
+                "CLIPBOARD_WRITE_FAILED",
+                f"寫入剪貼簿失敗：{exc}",
+            ) from exc
+        self.owner_pid = self.write_owner_pid
+        if not self._verify_text(text):
+            raise HelperError(
+                "CLIPBOARD_WRITE_FAILED",
+                "xclip 寫入後 0.25 秒驗證失敗",
+                {"owner_pid": self.write_owner_pid},
+            )
 
     def restore(self) -> None:
         if not self.saved:
             return
-        proc = _run(
-            ["xclip", "-i", "-selection", "clipboard"],
-            timeout=10,
-            input=self.text,
-        )
-        if proc.returncode != 0:
+        try:
+            self.restore_owner_pid = self._start_write(self.text or "")
+        except OSError as exc:
             raise HelperError(
                 "CLIPBOARD_RESTORE_FAILED",
-                f"還原剪貼簿失敗（exit {proc.returncode}）：{proc.stderr.strip()}",
+                f"還原剪貼簿失敗：{exc}",
+            ) from exc
+        self.owner_pid = self.restore_owner_pid
+        if not self._verify_text(self.text or ""):
+            raise HelperError(
+                "CLIPBOARD_RESTORE_FAILED",
+                "xclip 還原後 0.25 秒驗證失敗",
+                {"owner_pid": self.restore_owner_pid},
+            )
+        self.targets_after = self._targets()
+        self.formats_after_count = len(self.targets_after)
+        self.formats_preserved = self.targets_before <= self.targets_after
+        if not self.formats_preserved:
+            self.clipboard_warning = (
+                f"格式剩 {self.formats_after_count} 項，請重新複製一次以徹底回復"
             )
         self.saved = False
         self.restored = True
@@ -389,12 +483,14 @@ async def cmd_ax(args):
                 "max_depth": args.max_depth,
                 "timeout_ms": args.timeout_ms,
                 "max_lines": args.max_lines,
+                "debug_only": True,
             },
-            [],
+            [AX_DEBUG_WARNING],
             {
                 "path_used": "ax",
                 "ax_timeout_ms": args.timeout_ms,
                 "dry_run": True,
+                "debug_only": True,
             },
         )
 
@@ -426,6 +522,7 @@ async def cmd_ax(args):
                 "WARN 沒有 editable 控制項；打字請用截圖座標或 clipboard，"
                 "不要把這個樹當成 AX 可用。"
             )
+        shown.append(AX_DEBUG_WARNING)
         details = {
             "command": "ax",
             "app": app.name,
@@ -437,6 +534,7 @@ async def cmd_ax(args):
             "limits_unsupported": limits_unsupported,
             "depth": depth,
             "editable_count": editable_count,
+            "debug_only": True,
             "max_nodes": args.max_nodes,
             "max_depth": args.max_depth,
             "lines": shown,
@@ -444,7 +542,7 @@ async def cmd_ax(args):
         }
         summary = (
             f"ax app={app.name} app_nodes={len(subtree)} ax_nodes={len(nodes)} "
-            f"depth={depth} editable_count={editable_count} "
+            f"depth={depth} editable_count={editable_count} debug_only=True "
             f"truncated={observation.tree.truncated} "
             f"timeout_ms={args.timeout_ms} limits_unsupported={limits_unsupported}"
         )
@@ -459,6 +557,7 @@ async def cmd_ax(args):
                 "ax_truncated": observation.tree.truncated,
                 "ax_depth": depth,
                 "editable_count": editable_count,
+                "debug_only": True,
             },
         )
 
@@ -474,6 +573,11 @@ async def cmd_click(args):
         raise HelperError("INVALID_ARGUMENT", "座標模式需要同時給 --x 與 --y")
     if not use_ax and not use_point:
         raise HelperError("INVALID_ARGUMENT", "需要 --role/--name 或 --x/--y")
+    if use_ax and not getattr(args, "ax_debug", False):
+        raise HelperError(
+            "AX_DEBUG_ONLY",
+            "AX 定位只供除錯；請用 --x/--y 或 keyboard",
+        )
     if is_dry_run(args):
         plan = (
             f"dry-run click would click app={args.app} via AX role={args.role!r} name={args.name!r}"
@@ -493,9 +597,14 @@ async def cmd_click(args):
                 "button": args.button,
                 "count": args.count,
                 "path_used": "ax" if use_ax else "vision",
+                "debug_only": use_ax,
             },
-            [],
-            {"path_used": "ax" if use_ax else "vision", "dry_run": True},
+            [AX_DEBUG_WARNING] if use_ax else [],
+            {
+                "path_used": "ax" if use_ax else "vision",
+                "dry_run": True,
+                "debug_only": use_ax,
+            },
         )
 
     from mai_ui import Runtime
@@ -578,11 +687,12 @@ async def cmd_click(args):
                 "limits_unsupported": limits_unsupported,
                 "depth": depth,
                 "editable_count": editable_count,
+                "debug_only": True,
             }
             return (
-                f"click app={app.name} role={node.role} name={node.name!r} path_used=ax",
+                f"click app={app.name} role={node.role} name={node.name!r} path_used=ax debug_only=True",
                 details,
-                [],
+                [AX_DEBUG_WARNING],
                 {
                     "path_used": "ax",
                     "ax_timeout_ms": 4000,
@@ -590,6 +700,7 @@ async def cmd_click(args):
                     "ax_truncated": observation.tree.truncated,
                     "ax_depth": depth,
                     "editable_count": editable_count,
+                    "debug_only": True,
                 },
             )
 
@@ -690,6 +801,7 @@ async def cmd_click(args):
             },
             "active_window": active,
             "active_class": active_class,
+            "debug_only": False,
             **ax_metrics,
             "receipt": receipt_dict(receipt),
         }
@@ -717,29 +829,48 @@ async def cmd_type(args):
     if (args.role or args.name) and not (args.role and args.name):
         raise HelperError("INVALID_ARGUMENT", "--role 與 --name 要一起給")
     ascii_text = all(ord(char) < 128 for char in args.text)
-    planned_path = "input.text" if ascii_text else (
-        "ax.set_text" if (args.role and args.name) else "clipboard"
+    debug_ax = bool(getattr(args, "ax_debug", False) and args.role and args.name)
+    planned_path = (
+        "input.text"
+        if ascii_text
+        else ("ax.set_text" if debug_ax else "clipboard")
     )
+
     if is_dry_run(args):
-        dry_updates = {"path_used": planned_path, "dry_run": True}
-        if planned_path == "ax.set_text":
-            dry_updates["ax_timeout_ms"] = args.timeout_ms
+        details = {
+            "command": "type",
+            "dry_run": True,
+            "app": args.app,
+            "text_preview": text_preview(args.text),
+            "ascii": ascii_text,
+            "role": args.role,
+            "name": args.name,
+            "path_used": planned_path,
+            "ax_debug": getattr(args, "ax_debug", False),
+            "debug_only": debug_ax,
+            "verify_file": args.verify_file,
+        }
+        if not ascii_text and not debug_ax:
+            details.update(
+                {
+                    "clipboard_restored": None,
+                    "formats_preserved": None,
+                    "clipboard_formats_before": None,
+                    "clipboard_formats_after": None,
+                    "clipboard_warning": "執行時才會知道 TARGETS 格式是否完整；非文字剪貼簿會拒絕",
+                    "clipboard_owner_pid": None,
+                }
+            )
+        lines = [AX_DEBUG_WARNING] if debug_ax else []
+        updates = {"path_used": planned_path, "dry_run": True, "debug_only": debug_ax}
+        if debug_ax:
+            updates["ax_timeout_ms"] = args.timeout_ms
         return (
             f"dry-run type would type {text_preview(args.text)!r} app={args.app} "
             f"path={planned_path} verify_file={args.verify_file}",
-            {
-                "command": "type",
-                "dry_run": True,
-                "app": args.app,
-                "text_preview": text_preview(args.text),
-                "ascii": ascii_text,
-                "role": args.role,
-                "name": args.name,
-                "path_used": planned_path,
-                "verify_file": args.verify_file,
-            },
-            [],
-            dry_updates,
+            details,
+            lines,
+            updates,
         )
 
     from mai_ui import MuError, Runtime
@@ -763,6 +894,7 @@ async def cmd_type(args):
                 "text_preview": text_preview(args.text),
                 "ascii": True,
                 "path_used": "input.text",
+                "debug_only": False,
                 "receipt": receipt_dict(receipt),
                 "verified": verified,
                 "verify_file": args.verify_file,
@@ -772,7 +904,7 @@ async def cmd_type(args):
                 f"type app={args.app} path_used=input.text verified={verified}",
                 details,
                 [],
-                {"path_used": "input.text", "verified": verified},
+                {"path_used": "input.text", "verified": verified, "debug_only": False},
             )
 
         ax_set_text = "skipped_no_target"
@@ -780,7 +912,8 @@ async def cmd_type(args):
         ax_effect = None
         limits_unsupported = False
         ax_metrics = {}
-        if args.role and args.name:
+        if debug_ax:
+            ax_set_text = "not_attempted"
             observation, limits_unsupported = await observe_ax(
                 device, max_nodes=400, max_depth=8, timeout_ms=args.timeout_ms
             )
@@ -789,6 +922,7 @@ async def cmd_type(args):
                 "ax_nodes": len(observation.tree.nodes),
                 "ax_truncated": observation.tree.truncated,
                 "ax_depth": None,
+                "editable_count": None,
             }
             try:
                 app, subtree, nodes, by_id = resolve_app(observation, args.app)
@@ -835,7 +969,6 @@ async def cmd_type(args):
                             None,
                         )
                         if new_target is None:
-                            # 重新找同名節點
                             try:
                                 _, re_subtree, _, _ = resolve_app(recheck, app.name)
                             except HelperError:
@@ -859,9 +992,10 @@ async def cmd_type(args):
                         else:
                             ax_set_text = "no_effect"
                     except MuError as exc:
-                        # AX set_text 失敗不是 fatal：記錄後改用 clipboard。
                         ax_set_text = f"error:{exc.code}"
                         ax_effect = False
+        elif args.role and args.name:
+            ax_set_text = "skipped_ax_debug_not_enabled"
 
         if ax_set_text == "success":
             verified, content = await _verify_file(args.verify_file, args.text)
@@ -877,6 +1011,8 @@ async def cmd_type(args):
                 "text_preview": text_preview(args.text),
                 "ascii": False,
                 "path_used": "ax.set_text",
+                "ax_debug": getattr(args, "ax_debug", False),
+                "debug_only": True,
                 "ax_set_text": ax_set_text,
                 "ax_checked": ax_checked,
                 "ax_effect": ax_effect,
@@ -887,19 +1023,20 @@ async def cmd_type(args):
                 "note": None if args.verify_file else "未給 --verify-file，無法確認檔案內容",
             }
             return (
-                f"type app={args.app} path_used=ax.set_text verified={verified}",
+                f"type app={args.app} path_used=ax.set_text verified={verified} debug_only=True",
                 details,
-                [],
-                {"path_used": "ax.set_text", **ax_metrics},
+                [AX_DEBUG_WARNING],
+                {"path_used": "ax.set_text", "debug_only": True, **ax_metrics},
             )
 
-        # clipboard fallback
+        # 預設或 fallback：clipboard，使用非阻塞 xclip + guard。
         ensure_active(args.app)
         guard = ClipboardGuard()
         guard.save()
         restored = False
+        restore_error = None
         try:
-            write_receipt = await device.clipboard.write({"text/plain": args.text})
+            guard.write(args.text)
             ensure_active(args.app)
             ctrl_v = await press_key_checked(device, "v", ["ctrl"])
             await asyncio.sleep(0.4)
@@ -910,13 +1047,19 @@ async def cmd_type(args):
             except HelperError as exc:
                 restored = False
                 restore_error = exc
-            else:
-                restore_error = None
         if not restored:
             raise HelperError(
                 "CLIPBOARD_RESTORE_FAILED",
                 "已用 clipboard 輸入，但還原剪貼簿失敗",
-                {"clipboard_restored": False, "restore_error": str(restore_error)},
+                {
+                    "clipboard_restored": False,
+                    "formats_preserved": guard.formats_preserved,
+                    "clipboard_formats_before": guard.formats_before_count,
+                    "clipboard_formats_after": guard.formats_after_count,
+                    "clipboard_warning": guard.clipboard_warning,
+                    "clipboard_owner_pid": guard.owner_pid,
+                    "restore_error": str(restore_error),
+                },
             )
         verified, content = await _verify_file(args.verify_file, args.text)
         if args.verify_file and not verified:
@@ -925,29 +1068,54 @@ async def cmd_type(args):
                 f"--verify-file {args.verify_file} 不含輸入文字",
                 {"file": args.verify_file, "content": content},
             )
+        warning = guard.clipboard_warning
+        lines = []
+        if warning:
+            lines.append(f"WARN {warning}")
+        if debug_ax:
+            lines.append(AX_DEBUG_WARNING)
         details = {
             "command": "type",
             "app": args.app,
             "text_preview": text_preview(args.text),
             "ascii": False,
             "path_used": "clipboard",
+            "ax_debug": getattr(args, "ax_debug", False),
+            "debug_only": debug_ax,
             "ax_set_text": ax_set_text,
             "ax_checked": ax_checked,
             "ax_effect": ax_effect,
-            "clipboard_write": receipt_dict(write_receipt),
-            "ctrl_v": receipt_dict(ctrl_v),
             "clipboard_restored": True,
+            "formats_preserved": guard.formats_preserved,
+            "clipboard_formats_before": guard.formats_before_count,
+            "clipboard_formats_after": guard.formats_after_count,
+            "clipboard_warning": warning,
+            "clipboard_owner_pid": guard.owner_pid,
+            "clipboard_write_owner_pid": guard.write_owner_pid,
+            "clipboard_restore_owner_pid": guard.restore_owner_pid,
+            "ctrl_v": receipt_dict(ctrl_v),
             **ax_metrics,
             "verified": verified,
             "verify_file": args.verify_file,
             "note": None if args.verify_file else "未給 --verify-file，無法確認檔案內容",
         }
-        return (
-            f"type app={args.app} path_used=clipboard verified={verified}",
-            details,
-            [],
-            {"path_used": "clipboard", **ax_metrics},
-        )
+        summary = f"type app={args.app} path_used=clipboard verified={verified}"
+        if warning:
+            summary += f" WARN {warning}"
+        updates = {
+            "path_used": "clipboard",
+            "debug_only": debug_ax,
+            "clipboard_restored": True,
+            "formats_preserved": guard.formats_preserved,
+            "clipboard_formats_before": guard.formats_before_count,
+            "clipboard_formats_after": guard.formats_after_count,
+            "clipboard_warning": warning,
+            "clipboard_owner_pid": guard.owner_pid,
+            "clipboard_write_owner_pid": guard.write_owner_pid,
+            "clipboard_restore_owner_pid": guard.restore_owner_pid,
+            **ax_metrics,
+        }
+        return (summary, details, lines, updates)
 
 
 async def cmd_paste(args):
@@ -962,6 +1130,13 @@ async def cmd_paste(args):
                 "app": args.app,
                 "text_preview": text_preview(args.text),
                 "path_used": "clipboard",
+                "debug_only": False,
+                "clipboard_restored": None,
+                "formats_preserved": None,
+                "clipboard_formats_before": None,
+                "clipboard_formats_after": None,
+                "clipboard_warning": "執行時才會知道 TARGETS 格式是否完整；非文字剪貼簿會拒絕",
+                "clipboard_owner_pid": None,
                 "verify_file": args.verify_file,
             },
             [],
@@ -978,7 +1153,7 @@ async def cmd_paste(args):
         restored = False
         restore_error = None
         try:
-            write_receipt = await device.clipboard.write({"text/plain": args.text})
+            guard.write(args.text)
             ensure_active(args.app)
             ctrl_v = await press_key_checked(device, "v", ["ctrl"])
             await asyncio.sleep(0.4)
@@ -992,8 +1167,16 @@ async def cmd_paste(args):
         if not restored:
             raise HelperError(
                 "CLIPBOARD_RESTORE_FAILED",
-                "已用 clipboard 輸入，但還原剪貼簿失敗",
-                {"clipboard_restored": False, "restore_error": str(restore_error)},
+                "已用 clipboard 貼上，但還原剪貼簿失敗",
+                {
+                    "clipboard_restored": False,
+                    "formats_preserved": guard.formats_preserved,
+                    "clipboard_formats_before": guard.formats_before_count,
+                    "clipboard_formats_after": guard.formats_after_count,
+                    "clipboard_warning": guard.clipboard_warning,
+                    "clipboard_owner_pid": guard.owner_pid,
+                    "restore_error": str(restore_error),
+                },
             )
         verified, content = await _verify_file(args.verify_file, args.text)
         if args.verify_file and not verified:
@@ -1002,23 +1185,45 @@ async def cmd_paste(args):
                 f"--verify-file {args.verify_file} 不含貼上文字",
                 {"file": args.verify_file, "content": content},
             )
+        warning = guard.clipboard_warning
+        lines = [f"WARN {warning}"] if warning else []
         details = {
             "command": "paste",
             "app": args.app,
             "text_preview": text_preview(args.text),
             "path_used": "clipboard",
-            "clipboard_write": receipt_dict(write_receipt),
-            "ctrl_v": receipt_dict(ctrl_v),
+            "debug_only": False,
             "clipboard_restored": True,
+            "formats_preserved": guard.formats_preserved,
+            "clipboard_formats_before": guard.formats_before_count,
+            "clipboard_formats_after": guard.formats_after_count,
+            "clipboard_warning": warning,
+            "clipboard_owner_pid": guard.owner_pid,
+            "clipboard_write_owner_pid": guard.write_owner_pid,
+            "clipboard_restore_owner_pid": guard.restore_owner_pid,
+            "ctrl_v": receipt_dict(ctrl_v),
             "verified": verified,
             "verify_file": args.verify_file,
             "note": None if args.verify_file else "未給 --verify-file，無法確認檔案內容",
         }
+        summary = f"paste app={args.app} path_used=clipboard verified={verified}"
+        if warning:
+            summary += f" WARN {warning}"
         return (
-            f"paste app={args.app} path_used=clipboard verified={verified}",
+            summary,
             details,
-            [],
-            {"path_used": "clipboard"},
+            lines,
+            {
+                "path_used": "clipboard",
+                "clipboard_restored": True,
+                "formats_preserved": guard.formats_preserved,
+                "clipboard_formats_before": guard.formats_before_count,
+                "clipboard_formats_after": guard.formats_after_count,
+                "clipboard_warning": warning,
+                "clipboard_owner_pid": guard.owner_pid,
+                "clipboard_write_owner_pid": guard.write_owner_pid,
+                "clipboard_restore_owner_pid": guard.restore_owner_pid,
+            },
         )
 
 
@@ -1091,6 +1296,15 @@ def base_row(args) -> dict:
         "ax_truncated": None,
         "ax_depth": None,
         "editable_count": None,
+        "debug_only": None,
+        "clipboard_restored": None,
+        "formats_preserved": None,
+        "clipboard_formats_before": None,
+        "clipboard_formats_after": None,
+        "clipboard_warning": None,
+        "clipboard_owner_pid": None,
+        "clipboard_write_owner_pid": None,
+        "clipboard_restore_owner_pid": None,
         "dry_run": is_dry_run(args),
         "ok": None,
         "code": None,
@@ -1190,7 +1404,15 @@ def build_parser() -> argparse.ArgumentParser:
     shot.add_argument("--out", help="輸出路徑（預設 /tmp/opencode/desktop/helper-shot-<ts>.png）")
     shot.set_defaults(func=cmd_shot)
 
-    ax = sub.add_parser("ax", parents=[common], help="只輸出 --app 的 AX 子樹")
+    ax = sub.add_parser(
+        "ax",
+        parents=[common],
+        help="DEBUG ONLY：只輸出 --app 的 AX 子樹",
+        description=(
+            "DEBUG ONLY：AX 只供除錯，不是定位來源。"
+            "主路徑請用 shot + click --x/--y / keyboard / clipboard。"
+        ),
+    )
     ax.add_argument("--app", help="application 名稱（case-insensitive substring）")
     ax.add_argument("--max-nodes", type=int, default=400, help="要求 max_nodes（預設 400；v0.1.2 會拒絕）")
     ax.add_argument("--max-depth", type=int, default=8, help="要求 max_depth（預設 8；v0.1.2 會拒絕）")
@@ -1206,6 +1428,11 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--y", type=float)
     click.add_argument("--button", default="primary", choices=("primary", "secondary", "middle"))
     click.add_argument("--count", type=int, default=1)
+    click.add_argument(
+        "--ax-debug",
+        action="store_true",
+        help="允許 AX 定位（除錯用；一般請用 --x/--y）",
+    )
     click.set_defaults(func=cmd_click)
 
     type_p = sub.add_parser("type", parents=[common], help="輸入文字（ASCII 用 input.text；中文用 AX/clipboard）")
@@ -1215,6 +1442,11 @@ def build_parser() -> argparse.ArgumentParser:
     type_p.add_argument("--name")
     type_p.add_argument("--timeout-ms", type=int, default=4000, choices=(2000, 4000))
     type_p.add_argument("--verify-file")
+    type_p.add_argument(
+        "--ax-debug",
+        action="store_true",
+        help="用 ax.set_text 嘗試非 ASCII（除錯用；預設一律 clipboard）",
+    )
     type_p.set_defaults(func=cmd_type)
 
     paste = sub.add_parser("paste", parents=[common], help="用 guarded clipboard 貼上文字")
