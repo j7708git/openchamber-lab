@@ -1,6 +1,6 @@
 ---
 name: desktop-use
-description: Operate this machine's KDE/X11 desktop through the OpenGCUA Linux helper in the OpenChamber lab. Use for screenshot + coordinate clicks, keyboard shortcuts, and clipboard text (including Chinese). Machine-specific: X11 :0, helper venv, OpenGCUA v0.1.2; not for Wayland or other machines.
+description: "Operate this machine's KDE/X11 desktop through the OpenGCUA Linux helper in the OpenChamber lab. Use for screenshot + coordinate clicks, keyboard shortcuts, and clipboard text (including Chinese). Machine-specific: X11 :0, helper venv, OpenGCUA v0.1.2; not for Wayland or other machines."
 ---
 
 # desktop-use
