@@ -1,0 +1,12 @@
+{
+  "name": "@openchamber-lab/plugin-deepseek-websearch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek 官方 Search API 的 OpenCode websearch provider",
+  "main": "index.ts",
+  "devDependencies": {
+    "@opencode/plugin": "2.1.0",
+    "typescript": "6.0.3"
+  }
+}
